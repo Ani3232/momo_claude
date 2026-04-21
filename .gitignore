@@ -1,0 +1,13 @@
+# Dependency and Environment files
+.env
+__pycache__/
+*.py[c]
+# Task state and logs
+task_state.json
+task_state_audit.jsonl
+# Workspace data (usually stays local)
+workspace/
+conversations/
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+langchain
+langchain-community
+langchain-ollama
+langgraph
+termcolor
+rich
+duckduckgo-search
+python-dotenv
+pydantic
+llama-cloud
+playwright
