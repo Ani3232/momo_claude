@@ -1,14 +1,8 @@
 # ======================================================================||
-# ORCHESTRATOR AS SUBAGENT TOOL
+# ORCHESTRATOR AS SUBAGENT TOOL - Enhanced Memory Architecture
 # ======================================================================||
-# This transforms the main agent orchestrator into a reusable tool
-# that can be delegated to by other agents.
-#
-# Key design:
-# - Isolated LLM session (ChatOllama for gemma4)
-# - Full memory cascade (working, episodic, semantic)
-# - Tool binding and execution
-# - Returns clean summary to parent agent
+# Full three-tier memory cascade system matching main agent.
+# Intelligent distillation, caching, and compaction triggers.
 # ======================================================================||
 
 import operator
@@ -19,21 +13,22 @@ import os
 from typing import Annotated, TypedDict, Union, List, Optional, Sequence
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
+import hashlib
+import asyncio
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import BaseTool, Tool, tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages
 from langchain_ollama import ChatOllama
 from rich.console import Console
-import asyncio
-from llama_cloud import AsyncLlamaCloud
+
 from setup import workspace
 from basic_tools import base_tools
 from clarification_tool import ask_clarifying_questions_tool
 from task_state_tool import task_state_tools
-from str_replace_tool import str_replace_tool
+
 console = Console()
 
 # ======================================================================
@@ -45,28 +40,30 @@ _NEST    = "[dim]  ⎿[/dim]"
 
 ORCHESTRATOR_MODEL = "gemma4:31b-cloud"
 ORCHESTRATOR_CTX_WINDOW = 256000
-ORCHESTRATOR_CHAR_DELAY = 0.01  # For streaming output (if verbose mode)
-
-
-
+ORCHESTRATOR_CHAR_DELAY = 0.01
 
 load_dotenv()
 API = os.getenv("Parser_API")
-# ======================================================================||
-#  Parsing Tool
-# ======================================================================||
-_llama_client = AsyncLlamaCloud(api_key=API)
 
+# ======================================================================
+# ASYNC PDF PARSING TOOL
+# ======================================================================
 
 async def _parse_pdf_async(file_path: str, tier: str = "agentic") -> str:
-    file_obj = await _llama_client.files.create(file=file_path, purpose="parse")
-    result = await _llama_client.parsing.parse(
-        file_id=file_obj.id,
-        tier=tier,
-        version="latest",
-        expand=["markdown_full", "text_full"],
-    )
-    return result.markdown_full or result.text_full or "No content extracted"
+    """Async PDF parsing using Llama Cloud API."""
+    try:
+        from llama_cloud import AsyncLlamaCloud
+        _llama_client = AsyncLlamaCloud(api_key=API)
+        file_obj = await _llama_client.files.create(file=file_path, purpose="parse")
+        result = await _llama_client.parsing.parse(
+            file_id=file_obj.id,
+            tier=tier,
+            version="latest",
+            expand=["markdown_full", "text_full"],
+        )
+        return result.markdown_full or result.text_full or "No content extracted"
+    except Exception as e:
+        return f"PDF parsing failed: {str(e)}"
 
 
 @tool
@@ -77,12 +74,11 @@ def parse_pdf(file_path: str, tier: str = "agentic") -> str:
     """
     full_path = Path(workspace) / file_path
     if not full_path.exists():
-        # Also try absolute path in case agent passes full path
         full_path = Path(file_path)
     if not full_path.exists():
-        return f"❌ File not found: {file_path}. Use list_directory('.') to check available files."
+        return f"❌ File not found: {file_path}"
+    
     try:
-        # Always spin a NEW event loop — safe in any thread/sync context
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -93,53 +89,189 @@ def parse_pdf(file_path: str, tier: str = "agentic") -> str:
         return f"❌ PDF parsing failed: {str(e)}"
 
 
-
 # ======================================================================
-# MEMORY CASCADE (from original agent)
+# ENHANCED MEMORY CASCADE - Full Architecture
 # ======================================================================
 
-class MemoryCascade:
+class CompactionStrategy(Enum):
+    """Strategies for semantic memory distillation."""
+    FIFO = "fifo"
+    SEMANTIC_DISTILL = "semantic_distill"
+    TOPIC_CLUSTERING = "topic_clustering"
+
+
+class SubagentMemoryCascade:
     """
-    Manages the three-tier memory system for the orchestrator.
-    - Injects relevant context into LLM prompts
-    - Compacts episodic → semantic on overflow
-    - Maintains budget constraints
+    Full three-tier memory system for subagent orchestrator.
+    Mirrors the main agent's architecture with intelligent distillation.
+    
+    - Episodic Memory: Recent raw observations (FIFO eviction when full)
+    - Semantic Memory: Distilled long-term knowledge (LLM-summarized, persistent)
+    - Working Memory: Current turn state (ephemeral)
+    
+    Compaction Strategy:
+    - When episodic exceeds capacity, distill oldest N observations → semantic
+    - Semantic memory preserves context while reducing token overhead
+    - Caching prevents redundant LLM calls for same observations
     """
     
+    # Capacity tuning
     EPISODIC_CAPACITY = 10
-    SEMANTIC_MAX_TOKENS = 500
+    EPISODIC_BATCH_SIZE = 3
+    SEMANTIC_MAX_CHARS = 2000
+    COMPACTION_INTERVAL = 20
+    
+    # Strategy selection
+    DEFAULT_STRATEGY = CompactionStrategy.SEMANTIC_DISTILL
+    
+    # Base system prompt
     BASE_SYSTEM_PROMPT = None
+    
+    # Distillation cache
+    _distillation_cache: dict = {}
     
     @staticmethod
     def set_base_prompt(prompt: str):
         """Set the base system prompt."""
-        MemoryCascade.BASE_SYSTEM_PROMPT = prompt
+        SubagentMemoryCascade.BASE_SYSTEM_PROMPT = prompt
+    
+    @staticmethod
+    def _hash_observations(obs_list: List[str]) -> str:
+        """Create a hash of observations for caching."""
+        content = "|".join(obs_list)
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    @staticmethod
+    def _distill_observations_with_llm(observations: List[str], llm) -> str:
+        """
+        Use LLM to intelligently summarize observations.
+        Caches results to avoid redundant API calls.
+        """
+        obs_hash = SubagentMemoryCascade._hash_observations(observations)
+        
+        # Check cache
+        if obs_hash in SubagentMemoryCascade._distillation_cache:
+            return SubagentMemoryCascade._distillation_cache[obs_hash]
+        
+        episodic_str = "\n".join(observations)
+        
+        try:
+            summary_prompt = f"""You are extracting key facts from a conversation.
+Distill the following observations into 2-3 concise bullet points for long-term memory.
+Focus on: what was done, what was learned, and current state.
+
+Observations:
+{episodic_str}
+
+Provide ONLY the 2-3 bullet points, no preamble:"""
+            
+            response = llm.invoke(summary_prompt)
+            summary = response.content if hasattr(response, 'content') else str(response)
+            
+            # Cache the result
+            SubagentMemoryCascade._distillation_cache[obs_hash] = summary
+            return summary
+            
+        except Exception as e:
+            # Fallback: simple concatenation
+            fallback = "; ".join([f"{obs[:50]}..." for obs in observations])
+            SubagentMemoryCascade._distillation_cache[obs_hash] = fallback
+            return fallback
+    
+    @staticmethod
+    def should_trigger_compaction(state: 'OrchestratorState') -> bool:
+        """
+        Determine if episodic→semantic compaction should occur.
+        
+        Triggers:
+        1. Episodic memory exceeds capacity
+        2. Loop count hits compaction interval
+        """
+        loop_count = state.get("loop_count", 0)
+        episodic_len = len(state.get("episodic_memory", []))
+        
+        return (
+            episodic_len >= SubagentMemoryCascade.EPISODIC_CAPACITY
+            or (loop_count > 0 and loop_count % SubagentMemoryCascade.COMPACTION_INTERVAL == 0)
+        )
+    
+    @staticmethod
+    def compact_memory(state: 'OrchestratorState', llm, strategy: CompactionStrategy = None) -> dict:
+        """
+        Distill episodic memory into semantic memory.
+        
+        Process:
+        1. Select oldest batch from episodic memory
+        2. Summarize using LLM (if strategy permits)
+        3. Append to semantic memory with metadata
+        4. Evict from episodic memory
+        5. Trim semantic if exceeds limit
+        """
+        if strategy is None:
+            strategy = SubagentMemoryCascade.DEFAULT_STRATEGY
+        
+        episodic = state.get("episodic_memory", []).copy()
+        semantic = state.get("semantic_memory", "")
+        
+        if not episodic:
+            return {}
+        
+        # Select batch to distill (oldest BATCH_SIZE items)
+        batch_to_distill = episodic[:SubagentMemoryCascade.EPISODIC_BATCH_SIZE]
+        remaining_episodic = episodic[SubagentMemoryCascade.EPISODIC_BATCH_SIZE:]
+        
+        # Distill based on strategy
+        if strategy == CompactionStrategy.SEMANTIC_DISTILL:
+            distilled = SubagentMemoryCascade._distill_observations_with_llm(batch_to_distill, llm)
+        elif strategy == CompactionStrategy.FIFO:
+            distilled = "; ".join(batch_to_distill)
+        else:
+            distilled = "; ".join(batch_to_distill)
+        
+        # Append to semantic memory with metadata
+        loop_count = state.get("loop_count", 0)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_entry = f"[{timestamp} | Loop {loop_count}]\n{distilled}\n"
+        
+        new_semantic = semantic + "\n" + new_entry
+        
+        # Trim semantic memory if exceeds limit
+        if len(new_semantic) > SubagentMemoryCascade.SEMANTIC_MAX_CHARS:
+            new_semantic = new_semantic[-SubagentMemoryCascade.SEMANTIC_MAX_CHARS:]
+        
+        return {
+            "episodic_memory": remaining_episodic,
+            "semantic_memory": new_semantic,
+        }
     
     @staticmethod
     def build_system_prompt(state: 'OrchestratorState', base_prompt: str) -> str:
         """
-        Construct the system prompt with memory injection.
+        Construct the system prompt that injects all three memory tiers.
         """
-        # Use provided base prompt
         base = base_prompt
+        memory_sections = []
         
-        # Build memory context
-        episodic_str = ""
-        if state["episodic_memory"]:
-            episodic_str = "Recent observations:\n" + "\n".join(
-                f"  • {obs}" for obs in state["episodic_memory"][-5:]
-            )
+        # Add semantic memory (long-term context) first
+        if state.get("semantic_memory"):
+            semantic_section = f"""=== LONG-TERM PROJECT CONTEXT ===
+{state['semantic_memory']}
+
+"""
+            memory_sections.append(semantic_section)
         
-        semantic_str = ""
-        if state["semantic_memory"]:
-            semantic_str = f"Project context:\n{state['semantic_memory']}"
+        # Add episodic memory (recent observations)
+        if state.get("episodic_memory"):
+            recent_obs = state["episodic_memory"][-5:]
+            episodic_section = """=== RECENT OBSERVATIONS ===
+"""
+            for obs in recent_obs:
+                episodic_section += f"• {obs}\n"
+            episodic_section += "\n"
+            memory_sections.append(episodic_section)
         
-        memory_context = ""
-        if semantic_str:
-            memory_context += semantic_str + "\n\n"
-        if episodic_str:
-            memory_context += episodic_str + "\n"
-        
+        # Combine all sections
+        memory_context = "".join(memory_sections)
         system = f"""{base}
 
 {memory_context}"""
@@ -148,15 +280,27 @@ class MemoryCascade:
     
     @staticmethod
     def add_observation(state: 'OrchestratorState', observation: str) -> dict:
-        """Add observation to episodic memory with timestamp."""
-        episodic = state["episodic_memory"].copy()
+        """
+        After tool execution, integrate observation into episodic memory.
+        Enforces EPISODIC_CAPACITY limit via FIFO eviction.
+        """
+        episodic = state.get("episodic_memory", []).copy()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        episodic.append(f"[{timestamp}] {observation[:100]}")
         
-        if len(episodic) > MemoryCascade.EPISODIC_CAPACITY:
-            episodic = episodic[-MemoryCascade.EPISODIC_CAPACITY:]
+        # Truncate very long observations
+        if len(observation) > 300:
+            observation = observation[:300] + "..."
         
-        return {"episodic_memory": episodic, "observation": observation}
+        episodic.append(f"[{timestamp}] {observation}")
+        
+        # Enforce capacity: keep only most recent N observations
+        if len(episodic) > SubagentMemoryCascade.EPISODIC_CAPACITY:
+            episodic = episodic[-SubagentMemoryCascade.EPISODIC_CAPACITY:]
+        
+        return {
+            "episodic_memory": episodic,
+            "observation": observation,
+        }
 
 
 # ======================================================================
@@ -164,7 +308,7 @@ class MemoryCascade:
 # ======================================================================
 
 class OrchestratorState(TypedDict):
-    """State for the orchestrator subagent."""
+    """State for the orchestrator subagent with full memory cascade."""
     messages: Annotated[List[BaseMessage], operator.add]
     working_memory: str
     episodic_memory: List[str]
@@ -181,9 +325,10 @@ class OrchestratorState(TypedDict):
 
 def reasoning_node(state: OrchestratorState, llm, tools_list: List[BaseTool], base_prompt: str) -> dict:
     """
-    LLM-driven reasoning: decides tool use, kairos, or final answer.
+    LLM-driven reasoning with memory injection.
+    Decides: tool use, kairos, or final answer.
     """
-    system_prompt = MemoryCascade.build_system_prompt(state, base_prompt)
+    system_prompt = SubagentMemoryCascade.build_system_prompt(state, base_prompt)
     llm_with_tools = llm.bind_tools(tools_list)
     
     response = llm_with_tools.invoke(
@@ -248,6 +393,7 @@ def security_gate_node(state: OrchestratorState) -> dict:
 def tool_execution_node(state: OrchestratorState, tools_list: List[BaseTool]) -> dict:
     """
     Execute tool calls using LangChain's ToolNode.
+    Integrates observations into episodic memory.
     """
     last_message = state["messages"][-1]
     
@@ -271,13 +417,15 @@ def tool_execution_node(state: OrchestratorState, tools_list: List[BaseTool]) ->
         ]
     
     # Integrate into episodic memory
-    updated_episodic = state["episodic_memory"].copy()
+    updated_episodic = state.get("episodic_memory", []).copy()
     for msg in tool_messages:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        updated_episodic.append(f"[{timestamp}] {msg.name}: {msg.content}")
+        content = msg.content if len(msg.content) <= 150 else msg.content[:150] + "..."
+        updated_episodic.append(f"[{timestamp}] {msg.name}: {content}")
     
-    if len(updated_episodic) > MemoryCascade.EPISODIC_CAPACITY:
-        updated_episodic = updated_episodic[-MemoryCascade.EPISODIC_CAPACITY:]
+    # Enforce episodic capacity
+    if len(updated_episodic) > SubagentMemoryCascade.EPISODIC_CAPACITY:
+        updated_episodic = updated_episodic[-SubagentMemoryCascade.EPISODIC_CAPACITY:]
     
     return {
         "messages": tool_messages,
@@ -289,43 +437,23 @@ def tool_execution_node(state: OrchestratorState, tools_list: List[BaseTool]) ->
 def context_compaction_node(state: OrchestratorState, llm) -> dict:
     """
     Periodically distill episodic memory into semantic memory.
+    Intelligent triggers: capacity overflow or periodic interval.
     """
-    loop_count = state.get("loop_count", 0)
-    should_compact = (
-        len(state["episodic_memory"]) >= MemoryCascade.EPISODIC_CAPACITY
-        or loop_count % 20 == 0
-    )
-    
-    if not should_compact:
+    if not SubagentMemoryCascade.should_trigger_compaction(state):
         return {}
     
-    episodic = state["episodic_memory"]
+    episodic = state.get("episodic_memory", [])
     if not episodic:
         return {}
     
-    episodic_str = "\n".join(episodic[-10:])
+    # Perform compaction with intelligent distillation
+    compaction_result = SubagentMemoryCascade.compact_memory(
+        state,
+        llm,
+        strategy=CompactionStrategy.SEMANTIC_DISTILL
+    )
     
-    try:
-        summary_prompt = f"""Summarize these observations into 2-3 key facts:
-
-{episodic_str}
-
-Summary:"""
-        summary_response = llm.invoke(summary_prompt)
-        summary = summary_response.content if hasattr(summary_response, 'content') else str(summary_response)
-        
-    except Exception as e:
-        summary = "; ".join(episodic[-10:])
-    
-    new_semantic = state["semantic_memory"] + f"\n[Loop {loop_count}] {summary}"
-    
-    if len(new_semantic) > MemoryCascade.SEMANTIC_MAX_TOKENS:
-        new_semantic = new_semantic[-MemoryCascade.SEMANTIC_MAX_TOKENS:]
-    
-    return {
-        "semantic_memory": new_semantic,
-        "episodic_memory": episodic[-10:],
-    }
+    return compaction_result
 
 
 # ======================================================================
@@ -342,17 +470,12 @@ def route_after_reasoning(state: OrchestratorState) -> str:
         return END
 
 
-def route_after_tool(state: OrchestratorState) -> str:
-    """After tool execution, compact and return to reasoning."""
-    return "context_compaction"
-
-
 # ======================================================================
 # GRAPH BUILD
 # ======================================================================
 
 def build_orchestrator_graph(llm, tools_list: List[BaseTool], base_prompt: str):
-    """Assemble the orchestrator graph."""
+    """Assemble the orchestrator graph with full memory architecture."""
     workflow = StateGraph(OrchestratorState)
     
     from functools import partial
@@ -403,7 +526,7 @@ def run_orchestrator(task: str, instructions: str = "Return a concise summary wi
         system_prompt = "You are a helpful AI assistant with access to tools."
     
     # Assemble tools
-    orch_tools = task_state_tools + base_tools + [ask_clarifying_questions_tool, parse_pdf,str_replace_tool] 
+    orch_tools = task_state_tools + base_tools + [ask_clarifying_questions_tool, parse_pdf]
     
     # Initialize LLM
     orch_llm = ChatOllama(
@@ -413,10 +536,13 @@ def run_orchestrator(task: str, instructions: str = "Return a concise summary wi
         stream=False
     )
     
+    # Set base prompt for memory system
+    SubagentMemoryCascade.set_base_prompt(system_prompt)
+    
     # Build graph
     app = build_orchestrator_graph(orch_llm, orch_tools, system_prompt)
     
-    # Initialize state
+    # Initialize state with full memory cascade
     initial_state: OrchestratorState = {
         "messages": [HumanMessage(content=task)],
         "working_memory": "",
@@ -429,7 +555,6 @@ def run_orchestrator(task: str, instructions: str = "Return a concise summary wi
     }
     
     # Run the graph with iteration limit
-    final_state = None
     iteration = 0
     max_iterations = 15
     
@@ -464,17 +589,10 @@ def run_orchestrator(task: str, instructions: str = "Return a concise summary wi
     if isinstance(last_message, AIMessage) and last_message.content:
         result = str(last_message.content)
     else:
-        # Fallback: summarize observations
         if final_state["episodic_memory"]:
             result = "\n".join(final_state["episodic_memory"][-10:])
         else:
             result = "Orchestrator completed but no output generated."
-    
-    # Log token usage if available
-    if hasattr(last_message, 'response_metadata') and last_message.response_metadata:
-        meta = last_message.response_metadata
-        turn_tokens = (meta.get("prompt_eval_count") or 0) + (meta.get("eval_count") or 0)
-        # console.print(f"[dim]Tokens: {turn_tokens}[/dim]")
     
     console.print("[bold green]✓ Subagent Done[/bold green]")
     return result
@@ -486,8 +604,8 @@ def run_orchestrator(task: str, instructions: str = "Return a concise summary wi
 
 def _run_orchestrator_wrapper(task: str) -> str:
     """Wrapper for LangChain Tool."""
-    console.print(_BULLET," [bold cyan]Subagent running...[/bold cyan]")
-    console.print(_NEST, f"[dim]Prompt:{task:100}[/dim]")
+    console.print(_BULLET, "[bold cyan]Subagent running...[/bold cyan]")
+    console.print(_NEST, f"[dim]Prompt: {task[:100]}...[/dim]")
     return run_orchestrator(task)
 
 
@@ -495,10 +613,11 @@ subagent_tool = Tool(
     name="run_orchestrator",
     func=_run_orchestrator_wrapper,
     description=(
-        "Delegate complex, multi-step tasks to the main orchestrator agent. "
+        "Delegate complex, multi-step tasks to the orchestrator subagent. "
         "Use this for tasks requiring reasoning, tool chaining, file analysis, or context management. "
-        "The orchestrator manages its own memory cascade (working, episodic, semantic) "
-        "and can execute multiple tool calls in sequence. "
+        "The orchestrator manages a full three-tier memory cascade: working memory, episodic memory with FIFO eviction, "
+        "and semantic memory with intelligent LLM-based distillation. "
+        "This allows it to handle long-running tasks while maintaining context efficiency. "
         "Returns a clean summary of the results. "
         "Input: a clear description of the task to complete."
     )
@@ -506,13 +625,12 @@ subagent_tool = Tool(
 
 
 # ======================================================================
-# OPTIONAL: INTEGRATE INTO YOUR AGENT
+# OPTIONAL: TESTING
 # ======================================================================
 
 if __name__ == "__main__":
-    # Test the orchestrator as a tool
     test_task = "List all files in the current directory and summarize what you find."
-    print("Testing orchestrator tool...")
+    print("Testing enhanced orchestrator subagent...")
     result = run_orchestrator(test_task)
     print("\n=== RESULT ===")
     print(result)
